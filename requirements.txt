@@ -1,0 +1,7 @@
+numpy
+scipy
+opencv-python
+PyWavelets
+matplotlib
+pytest
+debugpy

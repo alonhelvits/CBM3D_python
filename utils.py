@@ -2,14 +2,20 @@ import numpy as np
 
 
 def symetrize(img, N):
-    img_pad = np.pad(img, ((N, N), (N, N)), 'symmetric')
+    if img.ndim == 2:
+        pad_width = ((N, N), (N, N))
+    elif img.ndim == 3:
+        pad_width = ((N, N), (N, N), (0, 0))
+    else:
+        raise ValueError("Expected a 2D grayscale or 3D channel-last image")
+    img_pad = np.pad(img, pad_width, 'symmetric')
     return img_pad
 
 
 def add_gaussian_noise(im, sigma, seed=None):
     if seed is not None:
         np.random.seed(seed)
-    im = im + (sigma * np.random.randn(*im.shape)).astype(np.int)
+    im = im + (sigma * np.random.randn(*im.shape)).astype(int)
     im = np.clip(im, 0., 255., out=None)
     im = im.astype(np.uint8)
     return im
@@ -53,7 +59,9 @@ def sd_weighting(group_3D):
     std = np.sum(group_3D * group_3D)
 
     res = (std - mean * mean / N) / (N - 1)
-    weight = 1.0 / np.sqrt(res) if res > 0. else 0.
+    # A constant group is still a valid estimate. Using zero here would leave
+    # aggregation pixels without any contribution and could produce NaNs.
+    weight = 1.0 / np.sqrt(res) if res > 0. else 1.
     return weight
 
 

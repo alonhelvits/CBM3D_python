@@ -2,3 +2,5 @@
 *.pyc
 *.xml
 *.iml
+.venv/
+temp_test_result/
