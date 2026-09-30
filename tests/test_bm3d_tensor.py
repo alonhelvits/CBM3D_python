@@ -174,6 +174,50 @@ def test_grayscale_tensor_pipeline_matches_legacy_float64():
     np.testing.assert_allclose(actual_final.numpy(), expected_final, atol=1e-10)
 
 
+def test_reference_patch_capture_preserves_outputs_and_returns_stage_metadata():
+    noisy = cv2.imread(
+        "test_data/sigma20/Cameraman.png", cv2.IMREAD_GRAYSCALE,
+    )[:24, :24]
+    tensor_input = torch.from_numpy(noisy).to(torch.float64)
+    config = _small_config()
+
+    expected_basic, expected_final = run_bm3d_tensor(tensor_input, 20, config)
+    actual_basic, actual_final, references = run_bm3d_tensor(
+        tensor_input,
+        20,
+        config,
+        return_reference_patches=True,
+    )
+
+    # Merely retaining the streamed reference estimates must not affect either
+    # stage output.
+    torch.testing.assert_close(actual_basic, expected_basic, rtol=0, atol=0)
+    torch.testing.assert_close(actual_final, expected_final, rtol=0, atol=0)
+
+    for stage_data, stage_config in (
+        (references.hard, config.hard),
+        (references.wiener, config.wiener),
+    ):
+        reference_count = stage_data.reference_indices.numel()
+        assert stage_data.patches.shape == (
+            1,
+            reference_count,
+            1,
+            stage_config.patch_size,
+            stage_config.patch_size,
+        )
+        assert stage_data.group_sizes.shape == (1, reference_count)
+        assert stage_data.patches.dtype == tensor_input.dtype
+        assert stage_data.patches.device == tensor_input.device
+        assert stage_data.reference_indices.device == tensor_input.device
+        assert stage_data.group_sizes.device == tensor_input.device
+        assert bool(torch.isfinite(stage_data.patches).all())
+
+        patch_rows, patch_columns = stage_data.patch_grid_shape
+        assert patch_rows * patch_columns >= reference_count
+        assert bool((stage_data.reference_indices < patch_rows * patch_columns).all())
+
+
 def test_color_tensor_pipeline_matches_legacy_float64():
     gray = cv2.imread(
         "test_data/image/Cameraman.png", cv2.IMREAD_GRAYSCALE,
@@ -190,8 +234,11 @@ def test_color_tensor_pipeline_matches_legacy_float64():
     )
 
     tensor_input = torch.from_numpy(noisy).permute(2, 0, 1)
-    actual_basic, actual_final = run_cbm3d_tensor(
-        tensor_input, 20, _small_config(),
+    actual_basic, actual_final, references = run_cbm3d_tensor(
+        tensor_input,
+        20,
+        _small_config(),
+        return_reference_patches=True,
     )
 
     np.testing.assert_allclose(
@@ -200,6 +247,10 @@ def test_color_tensor_pipeline_matches_legacy_float64():
     np.testing.assert_allclose(
         actual_final.permute(1, 2, 0).numpy(), expected_final, atol=1e-10,
     )
+    assert references.hard.patches.shape[0] == 1
+    assert references.hard.patches.shape[2:] == (3, 8, 8)
+    assert references.wiener.patches.shape[0] == 1
+    assert references.wiener.patches.shape[2:] == (3, 8, 8)
 
 
 def test_wiener_sigma_multiplier_is_an_explicit_algorithm_control():
@@ -226,10 +277,19 @@ def test_float32_pipeline_stays_on_the_selected_device():
     )[:24, :24]
     for device in devices:
         tensor = torch.from_numpy(noisy).to(device=device, dtype=torch.float32)
-        basic, final = run_bm3d_tensor(tensor, 20, _small_config())
+        basic, final, references = run_bm3d_tensor(
+            tensor,
+            20,
+            _small_config(),
+            return_reference_patches=True,
+        )
         assert basic.device.type == device.type
         assert final.device.type == device.type
         assert basic.dtype == torch.float32
         assert final.dtype == torch.float32
         assert bool(torch.isfinite(basic).all())
         assert bool(torch.isfinite(final).all())
+        for stage_data in (references.hard, references.wiener):
+            assert stage_data.patches.device.type == device.type
+            assert stage_data.patches.dtype == torch.float32
+            assert bool(torch.isfinite(stage_data.patches).all())

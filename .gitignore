@@ -9,3 +9,4 @@ __pycache__/
 temp_test_result/
 data/denoised/
 data/denoised_tensor/
+data/denoised_tensor_gray/

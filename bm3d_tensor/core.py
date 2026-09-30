@@ -42,6 +42,36 @@ class _InputLayout:
     channels: int
 
 
+@dataclass(frozen=True)
+class StageReferencePatches:
+    """Pre-aggregation reference estimates and the metadata locating them.
+
+    Attributes:
+        patches: Spatial-domain denoised reference patches with shape
+            ``[B,R,C,K,K]``. For every reference group, member zero is the
+            reference patch itself, so this stores ``spatial_patches[:, 0]``.
+        reference_indices: Linear reference locations in the padded patch
+            grid, shape ``[R]``.
+        group_sizes: Actual number of matched patches used to denoise each
+            reference, shape ``[B,R]``.
+        patch_grid_shape: ``(patch_rows, patch_columns)`` used to decode a
+            linear reference index into ``(row, column)``.
+    """
+
+    patches: torch.Tensor
+    reference_indices: torch.Tensor
+    group_sizes: torch.Tensor
+    patch_grid_shape: tuple[int, int]
+
+
+@dataclass(frozen=True)
+class BM3DReferencePatches:
+    """Reference-patch outputs captured from both BM3D stages."""
+
+    hard: StageReferencePatches
+    wiener: StageReferencePatches
+
+
 def _prepare_image(image: torch.Tensor, channels: int) -> tuple[torch.Tensor, _InputLayout]:
     """Validate a public input and normalize it to floating ``[B,C,H,W]``."""
     if not isinstance(image, torch.Tensor):
@@ -179,7 +209,8 @@ def _run_stage(
     config: BM3DConfig,
     *,
     basic: torch.Tensor | None = None,
-) -> torch.Tensor:
+    capture_reference_patches: bool = False,
+) -> tuple[torch.Tensor, StageReferencePatches | None]:
     """Run one complete hard or Wiener stage on padded ``[B,C,H,W]`` images.
 
     Dimension names used below:
@@ -201,9 +232,14 @@ def _run_stage(
         config: Hard-stage, Wiener-stage, and runtime chunk configuration.
         basic: Padded basic estimate with shape ``[B,C,H,W]``. ``None`` means
             run hard thresholding; a tensor means run Wiener filtering.
+        capture_reference_patches: Retain member zero from every filtered
+            group before Kaiser weighting and overlap-add aggregation.
 
     Returns:
-        The padded stage estimate with shape ``[B,C,H,W]``.
+        ``(stage_image, reference_data)``. ``stage_image`` is the padded stage
+        estimate with shape ``[B,C,H,W]``. ``reference_data`` is ``None``
+        unless capture was requested; otherwise its patch tensor has shape
+        ``[B,R,C,K,K]``.
 
     Matching yields ``[B,R,Nmax]`` indices and ``[B,R]`` group sizes. Each
     group-size bucket is gathered as ``[M,G,K,K]``, filtered, reconstructed,
@@ -279,6 +315,19 @@ def _run_stage(
     numerator = torch.zeros_like(noisy)
     denominator = torch.zeros(
         (batch, height, width), device=noisy.device, dtype=noisy.dtype,
+    )
+
+    # Capturing only member zero gives one denoised patch per reference:
+    # [B*R,C,K,K]. This is much smaller than retaining every variably sized
+    # [G,K,K] group, and it does not interfere with streaming aggregation.
+    captured_reference_patches = (
+        torch.empty(
+            (batch * reference_count, channels, patch_size, patch_size),
+            device=noisy.device,
+            dtype=noisy.dtype,
+        )
+        if capture_reference_patches
+        else None
     )
 
     # Hadamard transforms require power-of-two group lengths. References with
@@ -377,6 +426,12 @@ def _run_stage(
                 # Shape remains [M,G,K,K], but values are spatial patch pixels.
                 spatial_patches = inverse_transform(filtered, stage.transform)
 
+                if captured_reference_patches is not None:
+                    # Block matching forces the reference/self match to member
+                    # zero. Capture its [M,K,K] spatial estimate before the
+                    # Kaiser window and contributions from overlapping groups.
+                    captured_reference_patches[chosen, channel] = spatial_patches[:, 0]
+
                 # Overlap-add these M*G patches immediately. local match
                 # positions are [M,G]; batch ids and weights are both [M].
                 # Only channel 0 updates denominator [B,H,W].
@@ -402,7 +457,20 @@ def _run_stage(
     safe_denominator = torch.where(
         denominator > 0, denominator, torch.ones_like(denominator),
     )
-    return numerator / safe_denominator.unsqueeze(1)
+    stage_image = numerator / safe_denominator.unsqueeze(1)
+
+    if captured_reference_patches is None:
+        reference_data = None
+    else:
+        reference_data = StageReferencePatches(
+            patches=captured_reference_patches.reshape(
+                batch, reference_count, channels, patch_size, patch_size,
+            ),
+            reference_indices=matches.reference_indices,
+            group_sizes=matches.group_sizes,
+            patch_grid_shape=matches.patch_grid_shape,
+        )
+    return stage_image, reference_data
 
 
 def _validate_spatial_shape(image: torch.Tensor, config: BM3DConfig) -> None:
@@ -416,17 +484,27 @@ def run_bm3d_tensor(
     noisy: torch.Tensor,
     sigma: float,
     config: BM3DConfig | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    *,
+    return_reference_patches: bool = False,
+) -> (
+    tuple[torch.Tensor, torch.Tensor]
+    | tuple[torch.Tensor, torch.Tensor, BM3DReferencePatches]
+):
     """Denoise a grayscale tensor while keeping all work on its device.
 
     Args:
         noisy: ``[H,W]``, ``[1,H,W]``, or ``[B,1,H,W]`` tensor.
         sigma: Gaussian-noise standard deviation in 0--255 pixel units.
         config: Explicit stage/runtime settings, or classic defaults.
+        return_reference_patches: Also return one spatial, pre-aggregation
+            denoised patch for every reference in both stages.
 
     Returns:
         ``(basic, final)`` tensors with the input's rank and device. Float32
         and float64 are preserved; other input dtypes are promoted to float32.
+        If ``return_reference_patches=True``, a third
+        :class:`BM3DReferencePatches` value is returned. Its stage tensors use
+        the stable shape ``[B,R,C,K,K]`` regardless of the public image rank.
     """
     image, layout = _prepare_image(noisy, channels=1)
     sigma = float(sigma)
@@ -439,36 +517,69 @@ def run_bm3d_tensor(
 
     hard_radius = config.hard.search_radius
     noisy_hard = symmetric_pad(image, hard_radius)
-    basic_padded = _run_stage(noisy_hard, sigma_channels, config)
+    basic_padded, hard_reference_patches = _run_stage(
+        noisy_hard,
+        sigma_channels,
+        config,
+        capture_reference_patches=return_reference_patches,
+    )
     basic = _crop_padding(basic_padded, hard_radius)
 
     wiener_radius = config.wiener.search_radius
     noisy_wiener = symmetric_pad(image, wiener_radius)
     basic_wiener = symmetric_pad(basic, wiener_radius)
-    final_padded = _run_stage(
-        noisy_wiener, sigma_channels, config, basic=basic_wiener,
+    final_padded, wiener_reference_patches = _run_stage(
+        noisy_wiener,
+        sigma_channels,
+        config,
+        basic=basic_wiener,
+        capture_reference_patches=return_reference_patches,
     )
     final = _crop_padding(final_padded, wiener_radius)
-    return _restore_image(basic, layout), _restore_image(final, layout)
+    basic_output = _restore_image(basic, layout)
+    final_output = _restore_image(final, layout)
+    if not return_reference_patches:
+        return basic_output, final_output
+
+    assert hard_reference_patches is not None
+    assert wiener_reference_patches is not None
+    return (
+        basic_output,
+        final_output,
+        BM3DReferencePatches(
+            hard=hard_reference_patches,
+            wiener=wiener_reference_patches,
+        ),
+    )
 
 
 def run_cbm3d_tensor(
     noisy_rgb: torch.Tensor,
     sigma: float,
     config: BM3DConfig | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    *,
+    return_reference_patches: bool = False,
+) -> (
+    tuple[torch.Tensor, torch.Tensor]
+    | tuple[torch.Tensor, torch.Tensor, BM3DReferencePatches]
+):
     """Denoise an RGB tensor while keeping all work on its device.
 
     Args:
         noisy_rgb: RGB ``[3,H,W]`` or ``[B,3,H,W]`` tensor in ``[0,255]``.
         sigma: Per-RGB-channel Gaussian-noise standard deviation.
         config: Explicit stage/runtime settings, or classic color defaults.
+        return_reference_patches: Also return pre-aggregation reference-patch
+            estimates for both stages. Color patches remain in signed YUV.
 
     Returns:
         Clipped RGB ``(basic, final)`` tensors with the input's rank and
         device. Float32/float64 are preserved; other dtypes become float32.
         Internally the pipeline uses signed, full-resolution YUV, Y-only
         matching, per-channel sigma, and Y-derived shared weights.
+        If reference patches are requested, a third
+        :class:`BM3DReferencePatches` value is returned with stage tensors in
+        internal YUV order and shape ``[B,R,3,K,K]``.
     """
     rgb, layout = _prepare_image(noisy_rgb, channels=3)
     sigma = float(sigma)
@@ -489,17 +600,40 @@ def run_cbm3d_tensor(
 
     hard_radius = config.hard.search_radius
     noisy_hard = symmetric_pad(yuv, hard_radius)
-    basic_padded = _run_stage(noisy_hard, sigma_channels, config)
+    basic_padded, hard_reference_patches = _run_stage(
+        noisy_hard,
+        sigma_channels,
+        config,
+        capture_reference_patches=return_reference_patches,
+    )
     basic_yuv = _crop_padding(basic_padded, hard_radius)
 
     wiener_radius = config.wiener.search_radius
     noisy_wiener = symmetric_pad(yuv, wiener_radius)
     basic_wiener = symmetric_pad(basic_yuv, wiener_radius)
-    final_padded = _run_stage(
-        noisy_wiener, sigma_channels, config, basic=basic_wiener,
+    final_padded, wiener_reference_patches = _run_stage(
+        noisy_wiener,
+        sigma_channels,
+        config,
+        basic=basic_wiener,
+        capture_reference_patches=return_reference_patches,
     )
     final_yuv = _crop_padding(final_padded, wiener_radius)
 
     basic_rgb = torch.einsum("oc,bchw->bohw", inverse_color_matrix, basic_yuv).clamp(0, 255)
     final_rgb = torch.einsum("oc,bchw->bohw", inverse_color_matrix, final_yuv).clamp(0, 255)
-    return _restore_image(basic_rgb, layout), _restore_image(final_rgb, layout)
+    basic_output = _restore_image(basic_rgb, layout)
+    final_output = _restore_image(final_rgb, layout)
+    if not return_reference_patches:
+        return basic_output, final_output
+
+    assert hard_reference_patches is not None
+    assert wiener_reference_patches is not None
+    return (
+        basic_output,
+        final_output,
+        BM3DReferencePatches(
+            hard=hard_reference_patches,
+            wiener=wiener_reference_patches,
+        ),
+    )

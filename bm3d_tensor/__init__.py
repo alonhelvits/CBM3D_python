@@ -7,12 +7,19 @@ promoted to float32.
 """
 
 from .config import BM3DConfig, HardThresholdConfig, RuntimeConfig, WienerConfig
-from .core import run_bm3d_tensor, run_cbm3d_tensor
+from .core import (
+    BM3DReferencePatches,
+    StageReferencePatches,
+    run_bm3d_tensor,
+    run_cbm3d_tensor,
+)
 
 __all__ = [
     "BM3DConfig",
+    "BM3DReferencePatches",
     "HardThresholdConfig",
     "RuntimeConfig",
+    "StageReferencePatches",
     "WienerConfig",
     "run_bm3d_tensor",
     "run_cbm3d_tensor",

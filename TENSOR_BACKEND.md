@@ -100,6 +100,50 @@ Channels are processed sequentially. This keeps the peak patch-bank memory
 close to the grayscale case while still running every large operation in
 parallel on the selected device.
 
+## Accessing patches before aggregation
+
+Every filtered group contains `G` spatial patch estimates with shape
+`G,K,K`. Member zero is always the reference/self patch. The remaining members
+are estimates for the other matched locations and are also included in the
+overlap-add aggregation.
+
+By default these group tensors are streamed directly into aggregation and
+discarded. Requesting reference patches retains only member zero from every
+group:
+
+```python
+basic, final, references = run_bm3d_tensor(
+    noisy,
+    sigma=20,
+    config=config,
+    return_reference_patches=True,
+)
+
+hard_patches = references.hard.patches        # [B,R_hard,C,K_hard,K_hard]
+wiener_patches = references.wiener.patches    # [B,R_wiener,C,K_wiener,K_wiener]
+```
+
+These values are captured after inverse Hadamard and inverse 2D transforms,
+but before Kaiser weighting and overlap-add aggregation. `StageReferencePatches`
+also contains:
+
+- `reference_indices`: `[R]` linear positions in the padded patch grid;
+- `group_sizes`: `[B,R]` matched-patch counts used for filtering;
+- `patch_grid_shape`: the dimensions needed to convert a linear position into
+  `(row, column)`.
+
+The retained tensor is always five-dimensional, even for an unbatched
+grayscale input. For that case its shape is `[1,R,1,K,K]`. Color stage patches
+are returned in the internal signed YUV channel order.
+
+Only the reference estimate is retained because storing every member of every
+group would require up to `[B,R,Nmax,C,K,K]` plus a validity mask and can be
+several hundred megabytes for a 512x512 color image. The normal aggregation
+still uses all `G` group members.
+
+Set `SAVE_REFERENCE_PATCHES = True` in `run_bm3d_tensor.py` to save both stage
+tensors and their metadata to `06_reference_patches.pt`.
+
 ## Basic use
 
 ```python
@@ -166,8 +210,10 @@ Float64 CPU results match the legacy pipeline within `1e-10`; float32 results
 can differ slightly around hard thresholds and tied matches.
 
 - `python run_cbm3d.py` runs the unchanged NumPy reference implementation.
+- `python run_bm3d_tensor.py` runs tensor BM3D on a grayscale image.
 - `python run_cbm3d_tensor.py` selects CUDA, then MPS, then CPU and runs the
-  tensor implementation.
+  color tensor implementation.
 
-Tensor results are written to `data/denoised_tensor`, separate from legacy
-outputs.
+Grayscale tensor results are written to `data/denoised_tensor_gray`; color
+tensor results are written to `data/denoised_tensor`. Both are separate from
+legacy outputs.
