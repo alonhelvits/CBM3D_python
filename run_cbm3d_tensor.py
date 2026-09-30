@@ -20,6 +20,7 @@ OUTPUT_DIR = Path("data/denoised_tensor")
 IMAGE_SIZE = 512
 SIGMA = 20.0
 WIENER_SIGMA_MULTIPLIER = 1.0
+SAVE_REFERENCE_PATCHES = False
 
 
 def select_device() -> torch.device:
@@ -87,13 +88,42 @@ def main() -> None:
     synchronize(device)
     start = perf_counter()
     with torch.inference_mode():
-        basic, final = run_cbm3d_tensor(noisy_tensor, SIGMA, config)
+        if SAVE_REFERENCE_PATCHES:
+            basic, final, reference_patches = run_cbm3d_tensor(
+                noisy_tensor,
+                SIGMA,
+                config,
+                return_reference_patches=True,
+            )
+        else:
+            basic, final = run_cbm3d_tensor(noisy_tensor, SIGMA, config)
+            reference_patches = None
     synchronize(device)
     elapsed = perf_counter() - start
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     save_rgb(OUTPUT_DIR / "01_basic.png", basic)
     save_rgb(OUTPUT_DIR / "02_final.png", final)
+
+    if reference_patches is not None:
+        # The denoised patches are captured before aggregation and remain in
+        # the algorithm's signed YUV space. Their shape is [B,R,3,K,K].
+        torch.save(
+            {
+                "hard_patches": reference_patches.hard.patches.cpu(),
+                "hard_reference_indices": reference_patches.hard.reference_indices.cpu(),
+                "hard_group_sizes": reference_patches.hard.group_sizes.cpu(),
+                "hard_patch_grid_shape": reference_patches.hard.patch_grid_shape,
+                "wiener_patches": reference_patches.wiener.patches.cpu(),
+                "wiener_reference_indices": (
+                    reference_patches.wiener.reference_indices.cpu()
+                ),
+                "wiener_group_sizes": reference_patches.wiener.group_sizes.cpu(),
+                "wiener_patch_grid_shape": reference_patches.wiener.patch_grid_shape,
+            },
+            OUTPUT_DIR / "03_reference_patches.pt",
+        )
+
     print(f"Device: {device}")
     print(f"Image size: {tuple(noisy_tensor.shape)}")
     print(f"Runtime: {elapsed:.3f} seconds")

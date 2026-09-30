@@ -141,8 +141,11 @@ group would require up to `[B,R,Nmax,C,K,K]` plus a validity mask and can be
 several hundred megabytes for a 512x512 color image. The normal aggregation
 still uses all `G` group members.
 
-Set `SAVE_REFERENCE_PATCHES = True` in `run_bm3d_tensor.py` to save both stage
-tensors and their metadata to `06_reference_patches.pt`.
+Set `SAVE_REFERENCE_PATCHES = True` in either example runner to save both
+stage tensors and their metadata. `run_bm3d_tensor.py` writes
+`06_reference_patches.pt`; `run_cbm3d_tensor.py` writes
+`03_reference_patches.pt`. The color runner saves signed YUV patches, matching
+the representation used by collaborative filtering.
 
 ## Basic use
 
