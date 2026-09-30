@@ -5,3 +5,4 @@ PyWavelets
 matplotlib
 pytest
 debugpy
+torch

@@ -2,5 +2,9 @@
 *.pyc
 *.xml
 *.iml
+.DS_Store
+__pycache__/
 .venv/
 temp_test_result/
+data/denoised/
+data/denoised_tensor/

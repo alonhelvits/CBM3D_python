@@ -5,6 +5,13 @@ This is a Python implementation of BM3D.
 We refer to this [CPP](https://www.ipol.im/pub/art/2012/l-bm3d/) version.  
 This repository is guided by [Professor Yu-Xiang Wang](https://sites.cs.ucsb.edu/~yuxiangw/).
 
+### Tensor backend
+
+The repository now also contains an independent PyTorch implementation for
+CPU, CUDA, and Apple MPS. The original NumPy implementation remains unchanged
+and is used as the numerical reference. See [TENSOR_BACKEND.md](TENSOR_BACKEND.md)
+for tensor dimensions, algorithm flow, configuration, and examples.
+
 
 ### Why Python
 1. Easier to understand BM3D.  
@@ -51,5 +58,4 @@ This repository is guided by [Professor Yu-Xiang Wang](https://sites.cs.ucsb.edu
 | ![](test_data/image/Trees.png) | ![](result_compare/Trees.png) |
 | ![](test_data/image/Valldemossa.png) | ![](result_compare/Valldemossa.png) |
 | ![](test_data/image/Yard.png) | ![](result_compare/Yard.png) |
-
 
