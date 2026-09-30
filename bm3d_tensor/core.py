@@ -182,82 +182,171 @@ def _run_stage(
 ) -> torch.Tensor:
     """Run one complete hard or Wiener stage on padded ``[B,C,H,W]`` images.
 
+    Dimension names used below:
+
+    - ``B``: images in the batch.
+    - ``C``: channels (1 for grayscale, 3 for YUV color).
+    - ``H,W``: padded image height and width.
+    - ``K``: square patch size.
+    - ``L``: all valid overlapping patch positions.
+    - ``R``: reference-patch positions evaluated by block matching.
+    - ``Nmax``: maximum number of similar patches retained per reference.
+    - ``G``: actual power-of-two group size for one bucket.
+    - ``M``: groups in the current processing chunk.
+
+    Args:
+        noisy: Padded noisy image, shape ``[B,C,H,W]``.
+        sigma_channels: Noise sigma for each channel, shape ``[C]``. For color
+            these are the RGB sigma transformed into Y, U, and V sigmas.
+        config: Hard-stage, Wiener-stage, and runtime chunk configuration.
+        basic: Padded basic estimate with shape ``[B,C,H,W]``. ``None`` means
+            run hard thresholding; a tensor means run Wiener filtering.
+
+    Returns:
+        The padded stage estimate with shape ``[B,C,H,W]``.
+
     Matching yields ``[B,R,Nmax]`` indices and ``[B,R]`` group sizes. Each
     group-size bucket is gathered as ``[M,G,K,K]``, filtered, reconstructed,
     and immediately aggregated so a global table of filtered groups is never
     allocated.
     """
+    # Stage 1 has no basic estimate and filters groups with hard thresholding.
+    # Stage 2 receives the stage-1 estimate and uses it to calculate both
+    # matches and Wiener gains.
     is_wiener = basic is not None
     stage: HardThresholdConfig | WienerConfig = config.wiener if is_wiener else config.hard
+
+    # BM3D matches only one channel: grayscale for C=1 or luminance Y for C=3.
+    # Stage 1 matches noisy Y; stage 2 matches the cleaner basic-estimate Y.
+    # match_image: [B,1,H,W].
     match_image = basic[:, :1] if basic is not None else noisy[:, :1]
+
+    # matches.indices:     [B,R,Nmax], linear indices into the KxK patch grid.
+    # matches.group_sizes: [B,R], actual G selected for every reference.
     matches = _matching(match_image, stage, config)
 
+    # Image and patch-grid geometry. The patch grid has
+    # patch_rows=(H-K+1), patch_columns=(W-K+1), and L positions in total.
     batch, channels, height, width = noisy.shape
     patch_size = stage.patch_size
     patch_rows, patch_columns = matches.patch_grid_shape
     patch_count = patch_rows * patch_columns
     reference_count = matches.indices.shape[1]
     max_group_size = stage.max_group_size
+
+    # kaiser: [K,K]. Every reconstructed patch is multiplied by this window
+    # before overlap-add aggregation to reduce patch-boundary artifacts.
     kaiser = _kaiser_window(patch_size, noisy)
 
+    # Match indices are local to each image's L-position patch grid. Offsetting
+    # image b by b*L converts them into indices for a flattened [B*L,K,K] bank.
+    # batch_offsets: [B,1,1], broadcasting over R and Nmax.
     batch_offsets = (
         torch.arange(batch, device=noisy.device, dtype=torch.long)[:, None, None]
         * patch_count
     )
-    # Add per-image L offsets so one flattened [B*L,K,K] patch bank can serve
-    # a batched gather without mixing images.
+
+    # global_matches: [B*R,Nmax], used to gather transformed patch values.
     global_matches = (matches.indices + batch_offsets).reshape(
         batch * reference_count, max_group_size,
     )
+
+    # local_matches: [B*R,Nmax], still local to one image. Aggregation needs
+    # these values to recover each patch's top-left (row,column) position.
     local_matches = matches.indices.reshape(batch * reference_count, max_group_size)
+
+    # Flatten the B and R axes because subsequent bucketing treats every
+    # image/reference pair as an independent group.
+    # group_sizes: [B*R].
     group_sizes = matches.group_sizes.reshape(-1)
+
+    # One scalar aggregation weight per image/reference group: [B*R].
+    # Channel 0 calculates these weights; color channels 1 and 2 reuse them.
     reference_weights = torch.empty(
         batch * reference_count, device=noisy.device, dtype=noisy.dtype,
     )
+
+    # Maps each flattened reference back to its image: [B*R]. This prevents
+    # scatter aggregation from mixing members of different batch images.
     reference_batches = torch.arange(
         batch, device=noisy.device, dtype=torch.long,
     ).repeat_interleave(reference_count)
 
+    # numerator:   [B,C,H,W], weighted reconstructed-patch sums.
+    # denominator: [B,H,W], shared sums of aggregation weights/windows.
+    # Color uses a shared denominator because all channels reuse Y's matches
+    # and group weights.
     numerator = torch.zeros_like(noisy)
     denominator = torch.zeros(
         (batch, height, width), device=noisy.device, dtype=noisy.dtype,
     )
 
+    # Hadamard transforms require power-of-two group lengths. References with
+    # different G values are processed in separate dense buckets.
+    # Example for Nmax=32: [1,2,4,8,16,32].
     group_size_values: list[int] = []
     group_size = 1
     while group_size <= max_group_size:
         group_size_values.append(group_size)
         group_size *= 2
 
-    # Process channels sequentially to cap patch-bank memory. Channel 0 is Y
-    # for color and computes the shared aggregation weight before U/V run.
+    # Process channels sequentially to avoid keeping C full patch banks in
+    # memory simultaneously. Channel 0 is grayscale/Y and therefore runs first
+    # to populate reference_weights and the shared denominator.
     for channel in range(channels):
+        # Input slice: [B,1,H,W]. transformed_patch_bank first extracts every
+        # overlapping patch, then applies DCT/BIOR:
+        #     [B,1,H,W] -> [B,1,L,K,K] -> [B*L,K,K].
         noisy_bank = transformed_patch_bank(
             noisy[:, channel:channel + 1], patch_size, stage.transform,
         )[:, 0].reshape(batch * patch_count, patch_size, patch_size)
+
         if is_wiener:
             assert basic is not None
+            # The Wiener stage needs aligned noisy and basic coefficient banks,
+            # each [B*L,K,K]. The basic bank determines the Wiener gain.
             basic_bank = transformed_patch_bank(
                 basic[:, channel:channel + 1], patch_size, stage.transform,
             )[:, 0].reshape(batch * patch_count, patch_size, patch_size)
         else:
             basic_bank = None
 
+        # Accumulate one output channel at a time: [B,H,W]. It is copied into
+        # numerator[:,channel] only after every group-size bucket is complete.
         channel_accumulator = torch.zeros(
             (batch, height, width), device=noisy.device, dtype=noisy.dtype,
         )
+
         # Variable group lengths cannot form one dense tensor. Bucketing by G
         # produces dense [M,G,K,K] batches for Hadamard matrix multiplication.
         for size in group_size_values:
+            # selected: flattened reference indices whose actual group size is
+            # this bucket's G. Its length is the total groups in the bucket.
             selected = torch.nonzero(group_sizes == size, as_tuple=False).flatten()
+
+            # Bound peak gather/filter/scatter memory by processing at most M
+            # groups at once. Changing group_chunk_size does not change BM3D's
+            # mathematical parameters.
             for start in range(0, selected.numel(), config.runtime.group_chunk_size):
+                # chosen: [M], indices into the flattened B*R reference axis.
                 chosen = selected[start:start + config.runtime.group_chunk_size]
+
+                # Keep only the first G valid members of each reference group.
+                # selected_global_matches: [M,G].
                 selected_global_matches = global_matches[chosen, :size]
+
+                # Advanced indexing gathers one transformed patch per match:
+                # [B*L,K,K] indexed by [M,G] -> [M,G,K,K].
                 noisy_groups = noisy_bank[selected_global_matches]
 
                 if is_wiener:
                     assert basic_bank is not None
+                    # basic_groups is aligned element-for-element with
+                    # noisy_groups and also has shape [M,G,K,K].
                     basic_groups = basic_bank[selected_global_matches]
+
+                    # filtered: [M,G,K,K] transformed-domain estimates.
+                    # filter_weights: [M], one legacy Wiener weight per group.
                     filtered, filter_weights = wiener_filter_groups(
                         noisy_groups,
                         basic_groups,
@@ -265,6 +354,8 @@ def _run_stage(
                         sigma_multiplier=config.wiener.sigma_multiplier,
                     )
                 else:
+                    # Hard thresholding has the same input/output shapes as the
+                    # Wiener filter: groups [M,G,K,K], weights [M].
                     filtered, filter_weights = hard_threshold_groups(
                         noisy_groups,
                         sigma_channels[channel],
@@ -272,12 +363,23 @@ def _run_stage(
                     )
 
                 if channel == 0:
+                    # Weight mode is configured per stage. Store Y/grayscale's
+                    # [M] weights at their B*R positions for later U/V reuse.
                     weights = sd_weight(filtered) if stage.use_sd_weight else filter_weights
                     reference_weights[chosen] = weights
                 else:
+                    # U and V deliberately share Y's scalar group weights.
+                    # weights: [M].
                     weights = reference_weights[chosen]
 
+                # Invert only the per-patch 2D transform; the collaborative
+                # filter already inverted its Hadamard transform over G.
+                # Shape remains [M,G,K,K], but values are spatial patch pixels.
                 spatial_patches = inverse_transform(filtered, stage.transform)
+
+                # Overlap-add these M*G patches immediately. local match
+                # positions are [M,G]; batch ids and weights are both [M].
+                # Only channel 0 updates denominator [B,H,W].
                 _aggregate_groups(
                     channel_accumulator,
                     denominator if channel == 0 else None,
@@ -290,8 +392,13 @@ def _run_stage(
                     patch_columns=patch_columns,
                 )
 
+        # channel_accumulator [B,H,W] -> its slot in [B,C,H,W].
         numerator[:, channel] = channel_accumulator
 
+    # Pixels outside the covered reference region can have denominator zero in
+    # the padded border. They will be cropped by the caller, but replacing zero
+    # with one here prevents NaNs. Broadcasting [B,H,W] as [B,1,H,W] divides
+    # every channel by the same aggregation denominator.
     safe_denominator = torch.where(
         denominator > 0, denominator, torch.ones_like(denominator),
     )

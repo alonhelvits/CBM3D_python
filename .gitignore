@@ -5,6 +5,7 @@
 .DS_Store
 __pycache__/
 .venv/
+.vscode/*
 temp_test_result/
 data/denoised/
 data/denoised_tensor/
